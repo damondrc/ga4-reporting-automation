@@ -1,0 +1,47 @@
+# Runs every Monday at 12:00 UTC: pulls fresh GA4 data and commits
+# the updated report. Can also be triggered manually from the Actions tab.
+name: Weekly GA4 report
+
+on:
+  schedule:
+    - cron: "0 12 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write service account key
+        run: echo "$GA4_SA_KEY" > sa-key.json
+        env:
+          GA4_SA_KEY: ${{ secrets.GA4_SA_KEY }}
+
+      - name: Generate report
+        run: python ga4_report.py
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: sa-key.json
+          GA4_PROPERTY_ID: ${{ secrets.GA4_PROPERTY_ID }}
+
+      - name: Remove credentials
+        if: always()
+        run: rm -f sa-key.json
+
+      - name: Commit updated report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add report/
+          git diff --cached --quiet || git commit -m "Update weekly GA4 report [automated]"
+          git push
