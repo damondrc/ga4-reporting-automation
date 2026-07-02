@@ -1,0 +1,9 @@
+# Service account credentials -- NEVER commit these
+*service-account*.json
+sa-key.json
+credentials/
+.env
+
+__pycache__/
+*.pyc
+.DS_Store
