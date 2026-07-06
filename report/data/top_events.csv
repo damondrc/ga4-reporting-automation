@@ -1,8 +1,14 @@
 eventName,eventCount
-Tag - GA4 Config,3.0
-scroll_50,3.0
-first_visit,2.0
-page_view,2.0
-session_start,2.0
-user_engagement,2.0
-scroll,1.0
+page_view,268.0
+Tag - GA4 Config,264.0
+scroll_50,226.0
+scroll,150.0
+form_submit,145.0
+user_engagement,78.0
+click_proyecto_1,74.0
+click_cta,70.0
+session_start,62.0
+form_start,61.0
+first_visit,56.0
+click_proyecto_2,37.0
+click_proyecto_3,30.0
