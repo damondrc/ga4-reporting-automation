@@ -37,24 +37,72 @@ matplotlib.use("Agg")  # headless backend (works in CI)
 import matplotlib.pyplot as plt
 import pandas as pd
 
+# ------------------------------------------------------------------ filters --
+# Bug #6 (portfolio-analytics/Proyecto-3): a GA4 Event tag was left with its
+# Event Name field holding the tag's own name, so every page load emitted an
+# event literally called "Tag - GA4 Config". In the report published on
+# 2026-07-20 it ranked second by volume, above scroll_50.
+#
+# The tag was disabled in the container on 2026-07-26 (GTM v2.2), but GA4
+# cannot delete events it has already collected and its data filters are not
+# retroactive. With a rolling 28-day window the phantom keeps surfacing until
+# it falls out of range.
+#
+# THIS EXCLUSION IS TEMPORARY — delete it (and PHANTOM_EVENT, and the third
+# element of the top_events query) on or after PHANTOM_EXPIRES.
+PHANTOM_EVENT = "Tag - GA4 Config"
+PHANTOM_EXPIRES = date(2026, 8, 17)
+
+
+def exclude_phantom():
+    """Server-side exclusion of the phantom event.
+
+    Filtered in the query rather than dropped from the DataFrame afterwards:
+    a `df[df.eventName != ...]` buried in the transform layer reads as a
+    patch, whereas a named FilterExpression with this comment attached reads
+    as a documented decision — and it is the correct use of the API.
+
+    Built lazily so the google-analytics-data types are only imported on the
+    live path; --demo must keep working without them.
+    """
+    from google.analytics.data_v1beta.types import Filter, FilterExpression
+
+    return FilterExpression(
+        not_expression=FilterExpression(
+            filter=Filter(
+                field_name="eventName",
+                string_filter=Filter.StringFilter(value=PHANTOM_EVENT),
+            )
+        )
+    )
+
+
 # ----------------------------------------------------------------- queries --
-# Each report we pull from the API: name -> (dimensions, metrics)
+# Each report we pull from the API:
+#   name -> (dimensions, metrics, dimension_filter factory or None)
 QUERIES = {
     "daily_overview": (
         ["date"],
         ["sessions", "totalUsers", "screenPageViews", "eventCount"],
+        # Deliberately NOT filtered. Excluding the phantom here would change
+        # eventCount retroactively and break comparability with the CSVs
+        # already committed to this repo.
+        None,
     ),
     "by_channel": (
         ["sessionSource", "sessionMedium"],
         ["sessions", "totalUsers"],
+        None,
     ),
     "by_device": (
         ["deviceCategory"],
         ["sessions", "engagementRate"],
+        None,
     ),
     "top_events": (
         ["eventName"],
         ["eventCount"],
+        exclude_phantom,
     ),
 }
 
@@ -90,7 +138,8 @@ def fill_missing_days(df: pd.DataFrame, start, end, metrics) -> pd.DataFrame:
     return df.rename_axis("date").reset_index()
 
 
-def fetch_report(client, property_id: str, start, end, dims, mets) -> pd.DataFrame:
+def fetch_report(client, property_id: str, start, end, dims, mets,
+                 dim_filter=None) -> pd.DataFrame:
     """Run one GA4 Data API report and return it as a DataFrame."""
     from google.analytics.data_v1beta.types import (
         DateRange, Dimension, Metric, RunReportRequest,
@@ -102,6 +151,7 @@ def fetch_report(client, property_id: str, start, end, dims, mets) -> pd.DataFra
                                end_date=end.isoformat())],
         dimensions=[Dimension(name=d) for d in dims],
         metrics=[Metric(name=m) for m in mets],
+        dimension_filter=dim_filter() if dim_filter else None,
         limit=1000,
     )
     response = client.run_report(request)
@@ -123,10 +173,16 @@ def fetch_all(property_id: str, days: int) -> dict:
 
     client = BetaAnalyticsDataClient()
     start, end = report_window(days)
+
+    if date.today() >= PHANTOM_EXPIRES:
+        print(f"  note: {PHANTOM_EXPIRES} has passed — the '{PHANTOM_EVENT}' "
+              f"exclusion is no longer needed and can be removed.")
+
     data = {}
-    for name, (dims, mets) in QUERIES.items():
+    for name, (dims, mets, dim_filter) in QUERIES.items():
         print(f"  querying {name} ...")
-        data[name] = fetch_report(client, property_id, start, end, dims, mets)
+        data[name] = fetch_report(client, property_id, start, end,
+                                  dims, mets, dim_filter)
 
     # Only the daily series is reindexed. The other reports are breakdowns,
     # not time series: an absent channel or device is genuinely absent, not a
