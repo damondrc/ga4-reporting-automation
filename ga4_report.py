@@ -108,6 +108,9 @@ QUERIES = {
 
 ACCENT = "#4c78a8"
 
+# Max rows requested per report. See the truncation check in fetch_report().
+LIMIT = 1000
+
 
 # --------------------------------------------------------------- extraction --
 def report_window(days: int):
@@ -139,7 +142,7 @@ def fill_missing_days(df: pd.DataFrame, start, end, metrics) -> pd.DataFrame:
 
 
 def fetch_report(client, property_id: str, start, end, dims, mets,
-                 dim_filter=None) -> pd.DataFrame:
+                 dim_filter=None, name: str = "query") -> pd.DataFrame:
     """Run one GA4 Data API report and return it as a DataFrame."""
     from google.analytics.data_v1beta.types import (
         DateRange, Dimension, Metric, RunReportRequest,
@@ -152,9 +155,18 @@ def fetch_report(client, property_id: str, start, end, dims, mets,
         dimensions=[Dimension(name=d) for d in dims],
         metrics=[Metric(name=m) for m in mets],
         dimension_filter=dim_filter() if dim_filter else None,
-        limit=1000,
+        limit=LIMIT,
     )
     response = client.run_report(request)
+
+    # A truncated result set is indistinguishable from a complete one: the
+    # report would render with incomplete numbers and no sign anything is
+    # missing. Pagination would be unnecessary complexity at this volume — a
+    # visible warning is the proportionate answer to a silent failure.
+    if response.row_count > len(response.rows):
+        print(f"  WARNING  {name}: API reports {response.row_count} rows, only "
+              f"{len(response.rows)} fetched (limit={LIMIT}). Results are "
+              f"truncated — implement pagination if this persists.")
 
     rows = []
     for row in response.rows:
@@ -182,7 +194,7 @@ def fetch_all(property_id: str, days: int) -> dict:
     for name, (dims, mets, dim_filter) in QUERIES.items():
         print(f"  querying {name} ...")
         data[name] = fetch_report(client, property_id, start, end,
-                                  dims, mets, dim_filter)
+                                  dims, mets, dim_filter, name=name)
 
     # Only the daily series is reindexed. The other reports are breakdowns,
     # not time series: an absent channel or device is genuinely absent, not a
