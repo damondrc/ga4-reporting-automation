@@ -292,12 +292,28 @@ def make_charts(data: dict) -> dict:
 
 
 # -------------------------------------------------------------------- html --
+# GA4 returns rates as fractions (0.7741935483870968). Rendered raw they are
+# unreadable; rounded like every other float they become "0.77", which is not
+# how anyone reads an engagement rate either.
+RATE_COLUMNS = {"engagementRate", "bounceRate", "conversionRate"}
+
+
 def df_to_html_table(df: pd.DataFrame) -> str:
+    """Format for a human reader.
+
+    Presentation layer only — this runs after the CSV extracts are written, so
+    the CSVs keep the raw numeric values and stay machine-processable.
+    """
     d = df.copy()
     if "date" in d.columns:
         d["date"] = d["date"].dt.strftime("%Y-%m-%d")
-    for col in d.select_dtypes("float"):
-        d[col] = d[col].round(2)
+    for col in d.columns:
+        if col in RATE_COLUMNS:
+            d[col] = (d[col] * 100).round(1).astype(str) + "%"
+        elif pd.api.types.is_float_dtype(d[col]):
+            # fetch_report casts every metric with float(), so sessions and
+            # eventCount arrive as 65.0 / 281.0. They are counts.
+            d[col] = d[col].round(0).astype(int)
     return d.to_html(index=False, border=0, classes="tbl")
 
 
