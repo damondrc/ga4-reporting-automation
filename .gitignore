@@ -4,6 +4,9 @@ sa-key.json
 credentials/
 .env
 
+# Report generated outside report/ (e.g. `python ga4_report.py --output report.html`)
+/report.html
+
 __pycache__/
 *.pyc
 .DS_Store

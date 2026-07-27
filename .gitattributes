@@ -1,0 +1,12 @@
+# The report is generated output, not source.
+#
+# `linguist-generated` keeps report.html out of GitHub's language statistics
+# (its ~96 KB of base64-encoded charts otherwise make this Python project read
+# as 89% HTML) and collapses it in diffs, so the weekly automated commits are
+# reviewable instead of being buried under tens of thousands of characters.
+report/report.html linguist-generated=true
+
+# Normalize line endings to LF in the repository. The CSV and HTML artefacts
+# are rewritten by pandas/open() on every run; on Windows that produces CRLF
+# and every file shows up as a full-file diff with no content change.
+* text=auto
