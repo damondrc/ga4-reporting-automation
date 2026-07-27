@@ -7,8 +7,9 @@ pipeline queries the [GA4 Data API](https://developers.google.com/analytics/devg
 builds a self-contained HTML report with charts, and a **GitHub Action re-runs it
 every Monday** and commits the fresh report — zero manual steps.
 
-> 📈 **Latest report:** [`report/report.html`](report/report.html) — updated weekly by
-> [this workflow](.github/workflows/weekly-report.yml). Raw extracts in [`report/data/`](report/data/).
+> 📈 **Latest report (live):** **<https://damondrc.github.io/ga4-reporting-automation/>**
+> — regenerated and republished every Monday by [this workflow](.github/workflows/weekly-report.yml).
+> Source: [`report/report.html`](report/report.html) · raw extracts in [`report/data/`](report/data/).
 
 ## Why this project
 
