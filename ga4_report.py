@@ -233,9 +233,12 @@ def demo_data(days: int) -> dict:
         "sessions": [int(daily.sessions.sum() * s) for s in (0.55, 0.4, 0.05)],
         "engagementRate": [0.71, 0.54, 0.62],
     })
+    # Event names must match the real container. See the event dictionary in
+    # portfolio-analytics/docs/MEASUREMENT_PLAN.md §3.1 — sample data that
+    # invents names teaches the wrong ones to whoever reads this file first.
     events = pd.DataFrame({
-        "eventName": ["page_view", "session_start", "scroll_75",
-                      "cta_click", "form_submit", "first_visit"],
+        "eventName": ["page_view", "session_start", "scroll_50",
+                      "click_cta", "form_submit", "first_visit"],
         "eventCount": sorted(rng.integers(20, 900, 6).tolist(), reverse=True),
     })
     return {"daily_overview": daily, "by_channel": channels,
