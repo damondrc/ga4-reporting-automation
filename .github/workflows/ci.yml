@@ -1,0 +1,34 @@
+# Runs the pipeline end to end on sample data, on every push and PR.
+# No credentials involved: --demo exercises extraction shape, charting and
+# HTML rendering without touching the API.
+name: CI
+
+on:
+  push:
+    # The weekly workflow commits into report/ every Monday. Without this the
+    # repo would run a CI job against a commit that changed no code.
+    paths-ignore:
+      - 'report/**'
+      - '**.md'
+  pull_request:
+
+jobs:
+  demo-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Smoke test — full pipeline on sample data
+        # Written to /tmp, never to report/: a CI run must not be able to
+        # overwrite the real report with demo numbers.
+        run: python ga4_report.py --demo --output /tmp/report.html
+
+      - name: Assert the report was produced
+        run: test -s /tmp/report.html

@@ -1,5 +1,7 @@
 # GA4 Reporting Automation (Python + GA4 Data API + GitHub Actions)
 
+[![CI](https://github.com/damondrc/ga4-reporting-automation/actions/workflows/ci.yml/badge.svg)](https://github.com/damondrc/ga4-reporting-automation/actions/workflows/ci.yml)
+
 Automated traffic reporting for a GA4 property **I instrumented myself**: a Python
 pipeline queries the [GA4 Data API](https://developers.google.com/analytics/devguides/reporting/data/v1),
 builds a self-contained HTML report with charts, and a **GitHub Action re-runs it
