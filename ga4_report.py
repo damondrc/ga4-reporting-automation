@@ -62,7 +62,35 @@ ACCENT = "#4c78a8"
 
 
 # --------------------------------------------------------------- extraction --
-def fetch_report(client, property_id: str, days: int, dims, mets) -> pd.DataFrame:
+def report_window(days: int):
+    """The date window every query in a run shares.
+
+    Explicit dates instead of the API's relative "28daysAgo"/"yesterday"
+    strings: the server resolves those, so the caller never knows which range
+    it actually asked for, and the reindexing below has no range to fill.
+    """
+    end = date.today() - timedelta(days=1)
+    start = end - timedelta(days=days - 1)
+    return start, end
+
+
+def fill_missing_days(df: pd.DataFrame, start, end, metrics) -> pd.DataFrame:
+    """GA4 returns no row at all for a day with no activity.
+
+    Left as-is, matplotlib draws a straight line between the two rows that
+    surround the gap, which reads as gently declining traffic across days that
+    actually had none — and the x-axis stops being a time scale, since eleven
+    silent days occupy the same width as one. Reindexing over the full window
+    makes the zeros explicit and the axis honest.
+    """
+    full = pd.date_range(start, end)
+    if df.empty:
+        return pd.DataFrame({"date": full, **{m: 0 for m in metrics}})
+    df = df.set_index("date").reindex(full, fill_value=0)
+    return df.rename_axis("date").reset_index()
+
+
+def fetch_report(client, property_id: str, start, end, dims, mets) -> pd.DataFrame:
     """Run one GA4 Data API report and return it as a DataFrame."""
     from google.analytics.data_v1beta.types import (
         DateRange, Dimension, Metric, RunReportRequest,
@@ -70,7 +98,8 @@ def fetch_report(client, property_id: str, days: int, dims, mets) -> pd.DataFram
 
     request = RunReportRequest(
         property=f"properties/{property_id}",
-        date_ranges=[DateRange(start_date=f"{days}daysAgo", end_date="yesterday")],
+        date_ranges=[DateRange(start_date=start.isoformat(),
+                               end_date=end.isoformat())],
         dimensions=[Dimension(name=d) for d in dims],
         metrics=[Metric(name=m) for m in mets],
         limit=1000,
@@ -93,10 +122,18 @@ def fetch_all(property_id: str, days: int) -> dict:
     from google.analytics.data_v1beta import BetaAnalyticsDataClient
 
     client = BetaAnalyticsDataClient()
+    start, end = report_window(days)
     data = {}
     for name, (dims, mets) in QUERIES.items():
         print(f"  querying {name} ...")
-        data[name] = fetch_report(client, property_id, days, dims, mets)
+        data[name] = fetch_report(client, property_id, start, end, dims, mets)
+
+    # Only the daily series is reindexed. The other reports are breakdowns,
+    # not time series: an absent channel or device is genuinely absent, not a
+    # gap to fill.
+    data["daily_overview"] = fill_missing_days(
+        data["daily_overview"], start, end, QUERIES["daily_overview"][1]
+    )
     return data
 
 
@@ -107,7 +144,8 @@ def demo_data(days: int) -> dict:
     import numpy as np
 
     rng = np.random.default_rng(7)
-    dates = pd.date_range(end=date.today() - timedelta(days=1), periods=days)
+    start, end = report_window(days)          # same window as the live path
+    dates = pd.date_range(start, end)
     sessions = rng.integers(4, 28, days)
     daily = pd.DataFrame({
         "date": dates,
