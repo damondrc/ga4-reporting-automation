@@ -54,6 +54,31 @@ PHANTOM_EVENT = "Tag - GA4 Config"
 PHANTOM_EXPIRES = date(2026, 8, 17)
 
 
+# The signup funnel this property was instrumented to measure, in journey
+# order. Source of truth: portfolio-analytics/docs/MEASUREMENT_PLAN.md §2 —
+# the order is the journey, never the volume ranking. A bar chart sorted by
+# count is a ranking; a funnel is only a funnel if the steps stay in sequence.
+FUNNEL_STEPS = {
+    "view_item_list": "1. Viewed plans",
+    "select_item": "2. Selected a plan",
+    "begin_checkout": "3. Started signup",
+    "sign_up": "4. Created account",
+    "purchase": "5. Converted",
+}
+
+
+def only_funnel_events():
+    """Restrict the query to the funnel events (server-side)."""
+    from google.analytics.data_v1beta.types import Filter, FilterExpression
+
+    return FilterExpression(
+        filter=Filter(
+            field_name="eventName",
+            in_list_filter=Filter.InListFilter(values=list(FUNNEL_STEPS)),
+        )
+    )
+
+
 def exclude_phantom():
     """Server-side exclusion of the phantom event.
 
@@ -104,6 +129,14 @@ QUERIES = {
         ["eventCount"],
         exclude_phantom,
     ),
+    # The one report here that a default GA4 property could not produce:
+    # sessions, channels and devices exist everywhere without configuring
+    # anything, whereas this funnel is the instrumentation work itself.
+    "funnel": (
+        ["eventName"],
+        ["eventCount"],
+        only_funnel_events,
+    ),
 }
 
 ACCENT = "#4c78a8"
@@ -139,6 +172,40 @@ def fill_missing_days(df: pd.DataFrame, start, end, metrics) -> pd.DataFrame:
         return pd.DataFrame({"date": full, **{m: 0 for m in metrics}})
     df = df.set_index("date").reindex(full, fill_value=0)
     return df.rename_axis("date").reset_index()
+
+
+def order_funnel(df: pd.DataFrame) -> pd.DataFrame:
+    """Put the funnel back in journey order and compute the step-to-step rates.
+
+    The API returns the five events unordered (and omits any with no data), so
+    left alone they render as a ranking sorted by volume — which reads as a
+    funnel but is not one. Reindexing over FUNNEL_STEPS restores the sequence
+    and makes a missing step visible as a zero instead of a silent absence.
+
+    Caveat, stated in the report too: these are event counts, not users
+    progressing through the journey. A GA4 Exploration funnel counts distinct
+    users per step; this counts events, so a user who reloads the pricing page
+    is counted twice. The step ratios show the shape of the drop-off, not a
+    user-level conversion rate.
+    """
+    counts = dict(zip(df["eventName"], df["eventCount"])) if not df.empty else {}
+
+    rows, previous, entry = [], None, None
+    for event, label in FUNNEL_STEPS.items():
+        count = float(counts.get(event, 0))
+        if entry is None:
+            entry = count
+        rows.append({
+            "step": label,
+            "eventName": event,
+            "eventCount": count,
+            # First step is the baseline: 100% of itself.
+            "pctOfPrevious": 1.0 if previous is None
+                             else (count / previous if previous else 0.0),
+            "pctOfEntry": count / entry if entry else 0.0,
+        })
+        previous = count
+    return pd.DataFrame(rows)
 
 
 def fetch_report(client, property_id: str, start, end, dims, mets,
@@ -241,8 +308,15 @@ def demo_data(days: int) -> dict:
                       "click_cta", "form_submit", "first_visit"],
         "eventCount": sorted(rng.integers(20, 900, 6).tolist(), reverse=True),
     })
+    # Same raw shape the API returns for the funnel query (unordered event
+    # rows) so --demo exercises order_funnel exactly like the live path.
+    funnel = pd.DataFrame({
+        "eventName": ["purchase", "view_item_list", "sign_up",
+                      "begin_checkout", "select_item"],
+        "eventCount": [18, 47, 21, 33, 29],
+    })
     return {"daily_overview": daily, "by_channel": channels,
-            "by_device": devices, "top_events": events}
+            "by_device": devices, "top_events": events, "funnel": funnel}
 
 
 # ------------------------------------------------------------------ charts --
@@ -283,6 +357,22 @@ def make_charts(data: dict) -> dict:
         ax.spines[["top", "right"]].set_visible(False)
         charts["device"] = fig_to_base64(fig)
 
+    fn = data["funnel"]
+    if not fn.empty and fn["eventCount"].sum() > 0:
+        fig, ax = plt.subplots(figsize=(8, 3.4))
+        y = list(range(len(fn)))
+        ax.barh(y, fn["eventCount"], color=ACCENT)
+        ax.set_yticks(y)
+        ax.set_yticklabels(fn["step"])
+        ax.invert_yaxis()          # journey order reads top-to-bottom
+        for i, (count, pct) in enumerate(zip(fn["eventCount"], fn["pctOfPrevious"])):
+            suffix = "" if i == 0 else f"  ({pct * 100:.0f}% of previous)"
+            ax.text(count, i, f"  {int(count)}{suffix}", va="center", fontsize=8)
+        ax.set_xlim(0, max(fn["eventCount"].max(), 1) * 1.45)
+        ax.set_title("Signup funnel (event counts, journey order)")
+        ax.spines[["top", "right"]].set_visible(False)
+        charts["funnel"] = fig_to_base64(fig)
+
     ev = data["top_events"].sort_values("eventCount").tail(10)
     if not ev.empty:
         fig, ax = plt.subplots(figsize=(8, 3))
@@ -298,7 +388,8 @@ def make_charts(data: dict) -> dict:
 # GA4 returns rates as fractions (0.7741935483870968). Rendered raw they are
 # unreadable; rounded like every other float they become "0.77", which is not
 # how anyone reads an engagement rate either.
-RATE_COLUMNS = {"engagementRate", "bounceRate", "conversionRate"}
+RATE_COLUMNS = {"engagementRate", "bounceRate", "conversionRate",
+                "pctOfPrevious", "pctOfEntry"}
 
 
 def df_to_html_table(df: pd.DataFrame) -> str:
@@ -350,6 +441,7 @@ def build_html(data: dict, charts: dict, days: int, demo: bool) -> str:
   .tbl th, .tbl td {{ padding: .35rem .8rem; text-align: left;
                       border-bottom: 1px solid #e3e6e8; }}
   .tbl th {{ background: #f4f6f8; }}
+  .note {{ color: #666; font-size: .82rem; margin: .4rem 0 0; }}
   footer {{ color: #888; font-size: .8rem; margin-top: 2rem; }}
   details {{ margin: .5rem 0 1.5rem; }}
 </style></head><body>
@@ -365,6 +457,13 @@ def build_html(data: dict, charts: dict, days: int, demo: bool) -> str:
 <details><summary>View table</summary>{df_to_html_table(data["by_channel"])}</details>
 <h2>Devices</h2>{img("device")}
 <details><summary>View table</summary>{df_to_html_table(data["by_device"])}</details>
+<h2>Signup funnel</h2>{img("funnel")}
+<p class="note">Event counts in journey order, as defined in the
+<a href="https://github.com/damondrc/portfolio-analytics/blob/main/docs/MEASUREMENT_PLAN.md">measurement plan</a>.
+These are events, not distinct users progressing: a visitor who reloads the
+pricing page is counted twice, so the ratios describe the shape of the
+drop-off rather than a user-level conversion rate.</p>
+<details><summary>View table</summary>{df_to_html_table(data["funnel"])}</details>
 <h2>Events</h2>{img("events")}
 <details><summary>View table</summary>{df_to_html_table(data["top_events"])}</details>
 <footer>Generated {generated} · GA4 Data API ·
@@ -393,6 +492,10 @@ def main():
         print(f"Querying GA4 property {args.property_id} "
               f"(last {args.days} days)...")
         data = fetch_all(args.property_id, args.days)
+
+    # Applied outside fetch_all so both paths run the same transform: --demo
+    # (and therefore CI) exercises the ordering logic, not a shortcut around it.
+    data["funnel"] = order_funnel(data["funnel"])
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     csv_dir = os.path.join(os.path.dirname(args.output), "data")

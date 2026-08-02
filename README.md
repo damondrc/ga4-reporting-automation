@@ -25,7 +25,16 @@ small (it's a demo site) — the point is the working end-to-end pipeline, not t
 ## What the report includes
 
 Daily sessions/users/pageviews trend, acquisition by source/medium, device breakdown
-with engagement rate, and top events — over a configurable lookback window (default 28 days).
+with engagement rate, top events, and the **signup funnel** — over a configurable
+lookback window (default 28 days).
+
+The funnel is the part a default GA4 property could not produce: sessions, channels and
+devices exist everywhere without configuring anything, whereas
+`view_item_list → select_item → begin_checkout → sign_up → purchase` is the
+instrumentation designed in project 1. It is rendered in **journey order, never sorted by
+volume** — a bar chart sorted by count reads like a funnel but isn't one — with the
+step-to-step drop-off. Counts are events, not distinct users progressing; the report says
+so next to the chart.
 
 ## How it works
 
@@ -35,7 +44,7 @@ GA4 property ──▶ GA4 Data API ──▶ ga4_report.py ──▶ report/rep
                     GitHub Actions (cron, weekly) + repo secrets
 ```
 
-- **`ga4_report.py`** — 4 API reports → pandas → matplotlib charts embedded as base64
+- **`ga4_report.py`** — 5 API reports → pandas → matplotlib charts embedded as base64
   into a single portable HTML file.
 - **`--demo` mode** — generates sample data with the exact API response shape, so the
   pipeline can be tested with zero credentials: `python ga4_report.py --demo`
