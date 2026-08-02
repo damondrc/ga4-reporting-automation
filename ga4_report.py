@@ -34,6 +34,7 @@ from datetime import date, datetime, timedelta
 
 import matplotlib
 matplotlib.use("Agg")  # headless backend (works in CI)
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -75,6 +76,22 @@ def only_funnel_events():
         filter=Filter(
             field_name="eventName",
             in_list_filter=Filter.InListFilter(values=list(FUNNEL_STEPS)),
+        )
+    )
+
+
+def only_signups():
+    """sign_up is the only event carrying plan_id (Measurement Plan §3.4).
+
+    Without this filter the query returns one `(not set)` row aggregating
+    every other event, which would swamp the real plan split.
+    """
+    from google.analytics.data_v1beta.types import Filter, FilterExpression
+
+    return FilterExpression(
+        filter=Filter(
+            field_name="eventName",
+            string_filter=Filter.StringFilter(value="sign_up"),
         )
     )
 
@@ -137,9 +154,29 @@ QUERIES = {
         ["eventCount"],
         only_funnel_events,
     ),
+    # Event-scoped custom dimension registered in GA4 Admin. The API refers to
+    # it as `customEvent:<parameter name>`; registration is not retroactive, so
+    # it only returns data collected after the dimension was created.
+    "by_plan": (
+        ["customEvent:plan_id"],
+        ["eventCount"],
+        only_signups,
+    ),
 }
 
-ACCENT = "#4c78a8"
+# Queries whose failure must not abort the run. `by_plan` depends on a custom
+# dimension existing in the property: if it is missing or renamed the API
+# raises, and losing the whole weekly report over one optional breakdown would
+# be a worse outcome than shipping it without that section.
+OPTIONAL_QUERIES = {"by_plan"}
+
+ACCENT = "#3b6fd4"
+ACCENT_SOFT = "#dce6f9"
+INK = "#1f2933"
+MUTED = "#7b8794"
+GRID = "#e6eaef"
+POSITIVE = "#0f9d58"
+NEGATIVE = "#d93025"
 
 # Max rows requested per report. See the truncation check in fetch_report().
 LIMIT = 1000
@@ -156,6 +193,17 @@ def report_window(days: int):
     end = date.today() - timedelta(days=1)
     start = end - timedelta(days=days - 1)
     return start, end
+
+
+def previous_window(start, end):
+    """The window of equal length immediately before the reported one.
+
+    A number without a reference point is not information: 448 page views is
+    only meaningful next to what the same span produced before it.
+    """
+    span = (end - start).days + 1
+    prev_end = start - timedelta(days=1)
+    return prev_end - timedelta(days=span - 1), prev_end
 
 
 def fill_missing_days(df: pd.DataFrame, start, end, metrics) -> pd.DataFrame:
@@ -206,6 +254,84 @@ def order_funnel(df: pd.DataFrame) -> pd.DataFrame:
         })
         previous = count
     return pd.DataFrame(rows)
+
+
+PLAN_LABELS = {"plan_starter": "Starter", "plan_pro": "Pro",
+               "plan_business": "Business"}
+
+
+def tidy_plans(df: pd.DataFrame) -> pd.DataFrame:
+    """Give the custom-dimension column a readable name and label the plans."""
+    if df.empty:
+        return pd.DataFrame(columns=["plan", "eventCount", "share"])
+    d = df.rename(columns={"customEvent:plan_id": "plan_id"}).copy()
+    d["plan"] = d["plan_id"].map(lambda v: PLAN_LABELS.get(v, v or "(not set)"))
+    total = d["eventCount"].sum()
+    d["share"] = d["eventCount"] / total if total else 0.0
+    return (d[["plan", "eventCount", "share"]]
+            .sort_values("eventCount", ascending=False)
+            .reset_index(drop=True))
+
+
+def data_quality_checks(data: dict) -> list:
+    """Assertions about the data, rendered in the report itself.
+
+    A report that only shows numbers asks the reader to trust them. Stating
+    what was checked — and what failed — is what separates a dashboard from a
+    measurement deliverable, and it is how Bug #6 was caught in the first place.
+    """
+    checks = []
+    funnel = data.get("funnel", pd.DataFrame())
+
+    if not funnel.empty and funnel["eventCount"].sum() > 0:
+        # A later step cannot exceed the one before it: you cannot start
+        # checkout without having selected a plan. If it happens, the earlier
+        # step is under-firing — a collection defect, not user behaviour.
+        inversions = [
+            (funnel.iloc[i - 1], funnel.iloc[i])
+            for i in range(1, len(funnel))
+            if funnel.iloc[i]["eventCount"] > funnel.iloc[i - 1]["eventCount"]
+        ]
+        for prev_step, step in inversions:
+            checks.append((
+                "fail",
+                f'Funnel inversion: "{step["step"]}" ({int(step["eventCount"])}) '
+                f'exceeds "{prev_step["step"]}" ({int(prev_step["eventCount"])}). '
+                f'The earlier step is under-firing — investigate '
+                f'<code>{prev_step["eventName"]}</code>.'
+            ))
+        if not inversions:
+            checks.append(("pass", "Funnel steps decrease monotonically."))
+    else:
+        checks.append(("warn", "No funnel events in this period."))
+
+    events = data.get("top_events", pd.DataFrame())
+    if not events.empty and PHANTOM_EVENT in set(events["eventName"]):
+        checks.append(("fail", f'Phantom event "{PHANTOM_EVENT}" is still being '
+                               f"collected — the exclusion only hides it here."))
+    else:
+        checks.append(("pass", f'No events outside the plan dictionary '
+                               f'(phantom "{PHANTOM_EVENT}" excluded until '
+                               f'{PHANTOM_EXPIRES}).'))
+
+    daily = data.get("daily_overview", pd.DataFrame())
+    if not daily.empty:
+        silent = int((daily["sessions"] == 0).sum())
+        if silent:
+            checks.append(("warn", f"{silent} of {len(daily)} days recorded no "
+                                   f"sessions (shown as zeros, not gaps)."))
+
+    plans = data.get("by_plan", pd.DataFrame())
+    if plans.empty:
+        checks.append(("warn", "No plan breakdown: the <code>plan_id</code> "
+                               "custom dimension returned no rows. Registration "
+                               "is not retroactive."))
+    elif "(not set)" in set(plans["plan"]):
+        checks.append(("warn", "Some sign-ups report <code>(not set)</code> for "
+                               "<code>plan_id</code> — collected before the "
+                               "dimension was registered, or the parameter was "
+                               "missing."))
+    return checks
 
 
 def fetch_report(client, property_id: str, start, end, dims, mets,
@@ -260,8 +386,15 @@ def fetch_all(property_id: str, days: int) -> dict:
     data = {}
     for name, (dims, mets, dim_filter) in QUERIES.items():
         print(f"  querying {name} ...")
-        data[name] = fetch_report(client, property_id, start, end,
-                                  dims, mets, dim_filter, name=name)
+        try:
+            data[name] = fetch_report(client, property_id, start, end,
+                                      dims, mets, dim_filter, name=name)
+        except Exception as exc:                      # noqa: BLE001
+            if name not in OPTIONAL_QUERIES:
+                raise
+            print(f"  WARNING  {name}: query failed ({exc.__class__.__name__}); "
+                  f"the report continues without that section.")
+            data[name] = pd.DataFrame(columns=dims + mets)
 
     # Only the daily series is reindexed. The other reports are breakdowns,
     # not time series: an absent channel or device is genuinely absent, not a
@@ -269,7 +402,23 @@ def fetch_all(property_id: str, days: int) -> dict:
     data["daily_overview"] = fill_missing_days(
         data["daily_overview"], start, end, QUERIES["daily_overview"][1]
     )
+
+    # Same metrics over the preceding window, for the KPI deltas.
+    prev_start, prev_end = previous_window(start, end)
+    print("  querying previous period ...")
+    prev_dims, prev_mets, _ = QUERIES["daily_overview"]
+    prev = fetch_report(client, property_id, prev_start, prev_end,
+                        prev_dims, prev_mets, None, name="previous_period")
+    data["previous_period"] = totals_row(prev, prev_mets, prev_start, prev_end)
     return data
+
+
+def totals_row(df: pd.DataFrame, metrics, start, end) -> pd.DataFrame:
+    """Collapse a daily frame into the one-row totals used for the deltas."""
+    sums = {m: (float(df[m].sum()) if m in df.columns and not df.empty else 0.0)
+            for m in metrics}
+    return pd.DataFrame([{"start": start.isoformat(), "end": end.isoformat(),
+                          **sums}])
 
 
 # -------------------------------------------------------------------- demo --
@@ -315,16 +464,52 @@ def demo_data(days: int) -> dict:
                       "begin_checkout", "select_item"],
         "eventCount": [18, 47, 21, 33, 29],
     })
+    # Raw custom-dimension shape, exactly as the API returns it.
+    plans = pd.DataFrame({
+        "customEvent:plan_id": ["plan_pro", "plan_starter", "plan_business"],
+        "eventCount": [11, 6, 4],
+    })
+    start, end = report_window(days)
+    prev_start, prev_end = previous_window(start, end)
+    previous = pd.DataFrame([{
+        "start": prev_start.isoformat(), "end": prev_end.isoformat(),
+        "sessions": float(daily.sessions.sum()) * 0.82,
+        "totalUsers": float(daily.totalUsers.sum()) * 0.85,
+        "screenPageViews": float(daily.screenPageViews.sum()) * 0.9,
+        "eventCount": float(daily.eventCount.sum()) * 0.88,
+    }])
     return {"daily_overview": daily, "by_channel": channels,
-            "by_device": devices, "top_events": events, "funnel": funnel}
+            "by_device": devices, "top_events": events, "funnel": funnel,
+            "by_plan": plans, "previous_period": previous}
 
 
 # ------------------------------------------------------------------ charts --
 def fig_to_base64(fig) -> str:
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight",
+                transparent=True)
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode()
+
+
+def style_axes(ax, xgrid=False, ygrid=False):
+    """One look for every chart, applied in one place."""
+    ax.set_facecolor("none")
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.spines[["left", "bottom"]].set_color(GRID)
+    ax.tick_params(colors=MUTED, labelsize=8.5, length=0)
+    if xgrid:
+        ax.xaxis.grid(True, color=GRID, linewidth=0.8)
+    if ygrid:
+        ax.yaxis.grid(True, color=GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+
+
+def label_bars(ax, values, positions, fmt=lambda v: f"{int(v):,}", pad=1.02):
+    """Value labels next to horizontal bars, so no axis reading is needed."""
+    for value, pos in zip(values, positions):
+        ax.text(value * pad, pos, f" {fmt(value)}", va="center",
+                fontsize=8.5, color=INK)
 
 
 def make_charts(data: dict) -> dict:
@@ -332,53 +517,89 @@ def make_charts(data: dict) -> dict:
 
     daily = data["daily_overview"]
     if not daily.empty:
-        fig, ax = plt.subplots(figsize=(8, 3))
-        ax.plot(daily["date"], daily["sessions"], color=ACCENT, linewidth=2)
-        ax.fill_between(daily["date"], daily["sessions"], alpha=0.15, color=ACCENT)
-        ax.set_title("Sessions per day")
-        ax.spines[["top", "right"]].set_visible(False)
+        fig, ax = plt.subplots(figsize=(9, 2.9))
+        ax.plot(daily["date"], daily["sessions"], color=ACCENT, linewidth=2.2,
+                zorder=3)
+        ax.fill_between(daily["date"], daily["sessions"], alpha=0.16,
+                        color=ACCENT, zorder=2)
+
+        # The x-axis is the reason this chart was unreadable: with one tick per
+        # day the labels overlapped into a smear. AutoDateLocator picks a
+        # sensible number of ticks for the window length, and ConciseDateFormatter
+        # drops the repeated month/year instead of repeating them on every label.
+        locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        ax.set_ylim(bottom=0)
+        ax.margins(x=0.01)
+        style_axes(ax, ygrid=True)
         charts["daily"] = fig_to_base64(fig)
 
     ch = data["by_channel"].copy()
     if not ch.empty:
         ch["channel"] = ch["sessionSource"] + " / " + ch["sessionMedium"]
         ch = ch.sort_values("sessions").tail(8)
-        fig, ax = plt.subplots(figsize=(8, 3))
-        ax.barh(ch["channel"], ch["sessions"], color=ACCENT)
-        ax.set_title("Sessions by source / medium")
-        ax.spines[["top", "right"]].set_visible(False)
+        fig, ax = plt.subplots(figsize=(9, 0.46 * len(ch) + 1.1))
+        ax.barh(ch["channel"], ch["sessions"], color=ACCENT, height=0.62)
+        ax.set_xlim(0, max(ch["sessions"].max(), 1) * 1.18)
+        label_bars(ax, ch["sessions"], range(len(ch)))
+        ax.xaxis.set_visible(False)
+        style_axes(ax)
         charts["channel"] = fig_to_base64(fig)
 
     dev = data["by_device"]
     if not dev.empty:
-        fig, ax = plt.subplots(figsize=(5, 3))
-        ax.bar(dev["deviceCategory"], dev["sessions"], color=ACCENT)
-        ax.set_title("Sessions by device")
-        ax.spines[["top", "right"]].set_visible(False)
+        fig, ax = plt.subplots(figsize=(4.6, 2.9))
+        ax.bar(dev["deviceCategory"], dev["sessions"], color=ACCENT, width=0.55)
+        for x, value in enumerate(dev["sessions"]):
+            ax.text(x, value, f"{int(value):,}\n", ha="center", va="bottom",
+                    fontsize=8.5, color=INK)
+        ax.set_ylim(0, max(dev["sessions"].max(), 1) * 1.2)
+        ax.yaxis.set_visible(False)
+        style_axes(ax)
         charts["device"] = fig_to_base64(fig)
 
     fn = data["funnel"]
     if not fn.empty and fn["eventCount"].sum() > 0:
-        fig, ax = plt.subplots(figsize=(8, 3.4))
+        fig, ax = plt.subplots(figsize=(9, 3.2))
         y = list(range(len(fn)))
-        ax.barh(y, fn["eventCount"], color=ACCENT)
+        # Softer shade for intermediate steps so entry and conversion read as
+        # the two anchors of the journey.
+        colors = [ACCENT if i in (0, len(fn) - 1) else ACCENT_SOFT for i in y]
+        ax.barh(y, fn["eventCount"], color=colors, height=0.6)
         ax.set_yticks(y)
         ax.set_yticklabels(fn["step"])
         ax.invert_yaxis()          # journey order reads top-to-bottom
         for i, (count, pct) in enumerate(zip(fn["eventCount"], fn["pctOfPrevious"])):
-            suffix = "" if i == 0 else f"  ({pct * 100:.0f}% of previous)"
-            ax.text(count, i, f"  {int(count)}{suffix}", va="center", fontsize=8)
-        ax.set_xlim(0, max(fn["eventCount"].max(), 1) * 1.45)
-        ax.set_title("Signup funnel (event counts, journey order)")
-        ax.spines[["top", "right"]].set_visible(False)
+            suffix = "" if i == 0 else f"   {pct * 100:.0f}% of previous"
+            ax.text(count, i, f"  {int(count)}{suffix}", va="center",
+                    fontsize=8.5, color=INK)
+        ax.set_xlim(0, max(fn["eventCount"].max(), 1) * 1.5)
+        ax.xaxis.set_visible(False)
+        style_axes(ax)
         charts["funnel"] = fig_to_base64(fig)
+
+    plans = data.get("by_plan", pd.DataFrame())
+    if not plans.empty and plans["eventCount"].sum() > 0:
+        fig, ax = plt.subplots(figsize=(4.6, 2.9))
+        ax.bar(plans["plan"], plans["eventCount"], color=ACCENT, width=0.55)
+        for x, (value, share) in enumerate(zip(plans["eventCount"],
+                                               plans["share"])):
+            ax.text(x, value, f"{int(value)} · {share * 100:.0f}%\n",
+                    ha="center", va="bottom", fontsize=8.5, color=INK)
+        ax.set_ylim(0, max(plans["eventCount"].max(), 1) * 1.25)
+        ax.yaxis.set_visible(False)
+        style_axes(ax)
+        charts["plans"] = fig_to_base64(fig)
 
     ev = data["top_events"].sort_values("eventCount").tail(10)
     if not ev.empty:
-        fig, ax = plt.subplots(figsize=(8, 3))
-        ax.barh(ev["eventName"], ev["eventCount"], color=ACCENT)
-        ax.set_title("Top events by count")
-        ax.spines[["top", "right"]].set_visible(False)
+        fig, ax = plt.subplots(figsize=(9, 0.42 * len(ev) + 1.1))
+        ax.barh(ev["eventName"], ev["eventCount"], color=ACCENT, height=0.6)
+        ax.set_xlim(0, max(ev["eventCount"].max(), 1) * 1.18)
+        label_bars(ax, ev["eventCount"], range(len(ev)))
+        ax.xaxis.set_visible(False)
+        style_axes(ax)
         charts["events"] = fig_to_base64(fig)
 
     return charts
@@ -411,63 +632,222 @@ def df_to_html_table(df: pd.DataFrame) -> str:
     return d.to_html(index=False, border=0, classes="tbl")
 
 
+def kpi_card(label: str, value: float, previous: float, hint: str = "") -> str:
+    """A KPI with its change against the preceding window.
+
+    A bare total invites no judgement; the same total next to "+18% vs previous
+    28 days" does. When there is no prior period to compare against the delta is
+    omitted rather than shown as a fake 0%.
+    """
+    if previous:
+        change = (value - previous) / previous
+        arrow = "▲" if change >= 0 else "▼"
+        cls = "up" if change >= 0 else "down"
+        delta = (f'<span class="delta {cls}">{arrow} {abs(change) * 100:.1f}%</span>'
+                 f'<span class="vs">vs previous period</span>')
+    else:
+        delta = '<span class="vs">no prior period to compare</span>'
+    hint_html = f'<span class="hint">{hint}</span>' if hint else ""
+    return (f'<div class="kpi"><span class="kpi-label">{label}</span>'
+            f'<b>{int(value):,}</b>{delta}{hint_html}</div>')
+
+
+def quality_panel(checks: list) -> str:
+    if not checks:
+        return ""
+    icons = {"pass": "✓", "warn": "!", "fail": "✕"}
+    items = "".join(
+        f'<li class="chk {level}"><span class="badge">{icons[level]}</span>'
+        f'<span>{message}</span></li>'
+        for level, message in checks
+    )
+    failures = sum(1 for level, _ in checks if level == "fail")
+    summary = (f"{failures} check(s) failed" if failures
+               else "all checks passed")
+    return (f'<section class="card"><h2>Data quality</h2>'
+            f'<p class="note">Assertions run against this extract every time the '
+            f'report is generated — {summary}.</p>'
+            f'<ul class="checks">{items}</ul></section>')
+
+
 def build_html(data: dict, charts: dict, days: int, demo: bool) -> str:
     daily = data["daily_overview"]
-    total_sessions = int(daily["sessions"].sum()) if not daily.empty else 0
-    total_users = int(daily["totalUsers"].sum()) if not daily.empty else 0
-    total_pv = int(daily["screenPageViews"].sum()) if not daily.empty else 0
+    prev = data.get("previous_period", pd.DataFrame())
+    prev_row = prev.iloc[0] if not prev.empty else {}
+
+    def total(metric):
+        return float(daily[metric].sum()) if not daily.empty else 0.0
+
+    def prior(metric):
+        try:
+            return float(prev_row[metric])
+        except (KeyError, TypeError, IndexError):
+            return 0.0
+
+    if not daily.empty:
+        period = (f'{daily["date"].min():%d %b %Y} – '
+                  f'{daily["date"].max():%d %b %Y}')
+    else:
+        period = f"last {days} days"
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    banner = ('<p class="demo">⚠️ DEMO DATA — generated sample, not real '
-              'analytics. Run without <code>--demo</code> for live data.</p>'
-              if demo else "")
+    sessions, users = total("sessions"), total("totalUsers")
+    pages, events = total("screenPageViews"), total("eventCount")
+    pages_per_session = f"{pages / sessions:.1f} pages/session" if sessions else ""
 
-    def img(key):
-        return (f'<img src="data:image/png;base64,{charts[key]}" alt="{key}">'
-                if key in charts else "<p><em>No data for this period.</em></p>")
+    funnel = data.get("funnel", pd.DataFrame())
+    if not funnel.empty and funnel.iloc[0]["eventCount"]:
+        cvr = funnel.iloc[-1]["eventCount"] / funnel.iloc[0]["eventCount"]
+        funnel_kpi = (f'<div class="kpi"><span class="kpi-label">Funnel conversion</span>'
+                      f'<b>{cvr * 100:.1f}%</b>'
+                      f'<span class="vs">{int(funnel.iloc[-1]["eventCount"])} '
+                      f'conversions from {int(funnel.iloc[0]["eventCount"])} '
+                      f'plan views</span></div>')
+    else:
+        funnel_kpi = ""
+
+    banner = ('<p class="demo"><b>Demo data.</b> Generated sample with the exact '
+              'shape of the API response — not real analytics. Run without '
+              '<code>--demo</code> for live data.</p>' if demo else "")
+
+    def img(key, alt):
+        return (f'<img src="data:image/png;base64,{charts[key]}" alt="{alt}">'
+                if key in charts
+                else '<p class="empty">No data for this period.</p>')
+
+    def section(title, chart_key, alt, table_df, note=""):
+        note_html = f'<p class="note">{note}</p>' if note else ""
+        table = (f'<details><summary>View data table</summary>'
+                 f'{df_to_html_table(table_df)}</details>'
+                 if table_df is not None and not table_df.empty else "")
+        return (f'<section class="card"><h2>{title}</h2>{note_html}'
+                f'{img(chart_key, alt)}{table}</section>')
+
+    plans = data.get("by_plan", pd.DataFrame())
+    plan_section = section(
+        "Sign-ups by plan", "plans", "Sign-ups by plan", plans,
+        'From the event-scoped custom dimension <code>plan_id</code>, sent with '
+        'every <code>sign_up</code>. Registration is not retroactive, so this '
+        'only covers sign-ups collected after the dimension was created.'
+    ) if not plans.empty else ""
 
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>GA4 Report</title>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GA4 Report — {period}</title>
 <style>
-  body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif;
-         max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #222; }}
-  h1 {{ border-bottom: 3px solid {ACCENT}; padding-bottom: .3rem; }}
-  .kpis {{ display: flex; gap: 1rem; flex-wrap: wrap; margin: 1.5rem 0; }}
-  .kpi {{ background: #f4f6f8; border-radius: 8px; padding: 1rem 1.5rem; }}
-  .kpi b {{ font-size: 1.8rem; display: block; }}
-  .demo {{ background: #fff3cd; padding: .7rem 1rem; border-radius: 6px; }}
-  img {{ max-width: 100%; }}
-  .tbl {{ border-collapse: collapse; font-size: .85rem; }}
-  .tbl th, .tbl td {{ padding: .35rem .8rem; text-align: left;
-                      border-bottom: 1px solid #e3e6e8; }}
-  .tbl th {{ background: #f4f6f8; }}
-  .note {{ color: #666; font-size: .82rem; margin: .4rem 0 0; }}
-  footer {{ color: #888; font-size: .8rem; margin-top: 2rem; }}
-  details {{ margin: .5rem 0 1.5rem; }}
+  :root {{ --accent: {ACCENT}; --ink: {INK}; --muted: {MUTED};
+           --grid: {GRID}; --up: {POSITIVE}; --down: {NEGATIVE}; }}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Helvetica, Arial, sans-serif; margin: 0; background: #f5f7fa;
+          color: var(--ink); line-height: 1.55;
+          -webkit-font-smoothing: antialiased; }}
+  .wrap {{ max-width: 1000px; margin: 0 auto; padding: 2.5rem 1.25rem 3rem; }}
+  header.top {{ margin-bottom: 1.75rem; }}
+  .eyebrow {{ text-transform: uppercase; letter-spacing: .13em; font-size: .7rem;
+              font-weight: 700; color: var(--accent); margin: 0 0 .4rem; }}
+  h1 {{ font-size: 1.75rem; margin: 0 0 .35rem; letter-spacing: -.02em; }}
+  .period {{ color: var(--muted); font-size: .92rem; margin: 0; }}
+  .demo {{ background: #fff8e1; border: 1px solid #f5d98b; color: #6b5312;
+           padding: .8rem 1rem; border-radius: 10px; margin: 1.25rem 0 0;
+           font-size: .88rem; }}
+  .kpis {{ display: grid; gap: .9rem; margin: 1.75rem 0;
+           grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }}
+  .kpi {{ background: #fff; border: 1px solid var(--grid); border-radius: 12px;
+          padding: 1.05rem 1.15rem; }}
+  .kpi-label {{ display: block; font-size: .78rem; text-transform: uppercase;
+                letter-spacing: .07em; color: var(--muted); font-weight: 600; }}
+  .kpi b {{ font-size: 1.95rem; display: block; line-height: 1.15;
+            margin: .3rem 0 .25rem; letter-spacing: -.02em; }}
+  .delta {{ font-size: .84rem; font-weight: 700; margin-right: .4rem; }}
+  .delta.up {{ color: var(--up); }} .delta.down {{ color: var(--down); }}
+  .vs, .hint {{ font-size: .76rem; color: var(--muted); }}
+  .hint {{ display: block; }}
+  .card {{ background: #fff; border: 1px solid var(--grid); border-radius: 12px;
+           padding: 1.4rem 1.5rem; margin-bottom: 1.1rem; }}
+  .card h2 {{ font-size: 1.05rem; margin: 0 0 .5rem; letter-spacing: -.01em; }}
+  .grid-2 {{ display: grid; gap: 1.1rem;
+             grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }}
+  .grid-2 .card {{ margin-bottom: 0; }}
+  img {{ max-width: 100%; height: auto; display: block; margin: .35rem 0 0; }}
+  .note {{ color: var(--muted); font-size: .83rem; margin: 0 0 .7rem; }}
+  .empty {{ color: var(--muted); font-size: .85rem; font-style: italic; }}
+  details {{ margin-top: .9rem; }}
+  summary {{ cursor: pointer; font-size: .83rem; color: var(--accent);
+             font-weight: 600; }}
+  .tbl {{ border-collapse: collapse; font-size: .82rem; margin-top: .7rem;
+          width: 100%; }}
+  .tbl th, .tbl td {{ padding: .45rem .7rem; text-align: left;
+                      border-bottom: 1px solid var(--grid); }}
+  .tbl th {{ background: #f7f9fc; font-weight: 600; color: var(--muted);
+             text-transform: uppercase; font-size: .72rem;
+             letter-spacing: .05em; }}
+  .checks {{ list-style: none; padding: 0; margin: 0; }}
+  .chk {{ display: flex; gap: .65rem; align-items: flex-start;
+          padding: .5rem 0; border-top: 1px solid var(--grid);
+          font-size: .87rem; }}
+  .chk:first-child {{ border-top: 0; }}
+  .badge {{ flex: none; width: 1.25rem; height: 1.25rem; border-radius: 50%;
+            display: grid; place-items: center; font-size: .72rem;
+            font-weight: 700; color: #fff; margin-top: .12rem; }}
+  .pass .badge {{ background: var(--up); }}
+  .warn .badge {{ background: #e8a317; }}
+  .fail .badge {{ background: var(--down); }}
+  code {{ background: #f0f3f8; padding: .08rem .3rem; border-radius: 4px;
+          font-size: .88em; }}
+  footer {{ color: var(--muted); font-size: .8rem; margin-top: 1.75rem;
+            text-align: center; }}
+  footer a {{ color: var(--accent); }}
 </style></head><body>
-<h1>GA4 Traffic Report — last {days} days</h1>
-{banner}
+<div class="wrap">
+<header class="top">
+  <p class="eyebrow">Automated weekly report</p>
+  <h1>GA4 traffic &amp; signup funnel</h1>
+  <p class="period">{period} · {days}-day window</p>
+  {banner}
+</header>
+
 <div class="kpis">
-  <div class="kpi"><b>{total_sessions:,}</b>Sessions</div>
-  <div class="kpi"><b>{total_users:,}</b>Users</div>
-  <div class="kpi"><b>{total_pv:,}</b>Page views</div>
+  {kpi_card("Sessions", sessions, prior("sessions"))}
+  {kpi_card("Users", users, prior("totalUsers"))}
+  {kpi_card("Page views", pages, prior("screenPageViews"), pages_per_session)}
+  {kpi_card("Events", events, prior("eventCount"))}
+  {funnel_kpi}
 </div>
-<h2>Daily trend</h2>{img("daily")}
-<h2>Acquisition</h2>{img("channel")}
-<details><summary>View table</summary>{df_to_html_table(data["by_channel"])}</details>
-<h2>Devices</h2>{img("device")}
-<details><summary>View table</summary>{df_to_html_table(data["by_device"])}</details>
-<h2>Signup funnel</h2>{img("funnel")}
-<p class="note">Event counts in journey order, as defined in the
-<a href="https://github.com/damondrc/portfolio-analytics/blob/main/docs/MEASUREMENT_PLAN.md">measurement plan</a>.
-These are events, not distinct users progressing: a visitor who reloads the
-pricing page is counted twice, so the ratios describe the shape of the
-drop-off rather than a user-level conversion rate.</p>
-<details><summary>View table</summary>{df_to_html_table(data["funnel"])}</details>
-<h2>Events</h2>{img("events")}
-<details><summary>View table</summary>{df_to_html_table(data["top_events"])}</details>
+
+{section("Sessions per day", "daily", "Sessions per day", None,
+         "Days with no activity are reindexed to zero: the API omits them, "
+         "which would otherwise draw a slope across a silent stretch.")}
+
+{section("Signup funnel", "funnel", "Signup funnel", funnel,
+         'Journey order, as defined in the '
+         '<a href="https://github.com/damondrc/portfolio-analytics/blob/main/docs/MEASUREMENT_PLAN.md">measurement plan</a> '
+         '— never sorted by volume, which would make it a ranking. These are '
+         'event counts, not distinct users progressing, so the ratios describe '
+         'the shape of the drop-off rather than a user-level conversion rate.')}
+
+{plan_section}
+
+<div class="grid-2">
+{section("Acquisition", "channel", "Sessions by source and medium",
+         data["by_channel"],
+         "Synthetic traffic from the simulator is tagged "
+         "<code>traffic-sim / synthetic</code>, so it stays separable.")}
+{section("Devices", "device", "Sessions by device", data["by_device"])}
+</div>
+
+{section("Top events", "events", "Top events by count", data["top_events"],
+         f'The phantom event <code>{PHANTOM_EVENT}</code> is excluded '
+         f'server-side until {PHANTOM_EXPIRES} — see Bug #6.')}
+
+{quality_panel(data_quality_checks(data))}
+
 <footer>Generated {generated} · GA4 Data API ·
-<a href="https://github.com/damondrc/ga4-reporting-automation">source</a></footer>
+<a href="https://github.com/damondrc/ga4-reporting-automation">source</a> ·
+<a href="https://github.com/damondrc/portfolio-analytics">instrumentation</a>
+</footer>
+</div>
 </body></html>"""
 
 
@@ -496,6 +876,7 @@ def main():
     # Applied outside fetch_all so both paths run the same transform: --demo
     # (and therefore CI) exercises the ordering logic, not a shortcut around it.
     data["funnel"] = order_funnel(data["funnel"])
+    data["by_plan"] = tidy_plans(data["by_plan"])
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     csv_dir = os.path.join(os.path.dirname(args.output), "data")

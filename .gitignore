@@ -10,3 +10,6 @@ credentials/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Local chart previews (generated for visual review, never committed)
+.preview/
