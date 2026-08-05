@@ -11,16 +11,44 @@ every Monday** and commits the fresh report — zero manual steps.
 > — regenerated and republished every Monday by [this workflow](.github/workflows/weekly-report.yml).
 > Source: [`report/report.html`](report/report.html) · raw extracts in [`report/data/`](report/data/).
 
-## Why this project
+## Part of a three-repo system
 
-This is the third piece of my analytics portfolio, and it closes the loop with **real data**:
+Each repository covers one stage of the same pipeline. What they share on
+purpose is the **GA4 event schema**.
 
-1. **[portfolio-analytics](https://damondrc.github.io/portfolio-analytics)** — I implement the tracking (GTM + GA4). *Collection.*
-2. **[ecommerce-funnel-analysis](https://github.com/damondrc/ecommerce-funnel-analysis)** — I analyze event data with SQL + Tableau (simulated at scale). *Analysis.*
-3. **This repo** — I extract what my own tracking collects, via API, and automate the reporting. *Activation.*
+| Stage | Repository | Dataset |
+|---|---|---|
+| **Collection** | [portfolio-analytics](https://github.com/damondrc/portfolio-analytics) — GTM + GA4 implementation, measurement plan, consent, tracking QA | Real · live · low volume |
+| **Analysis** | [ecommerce-funnel-analysis](https://github.com/damondrc/ecommerce-funnel-analysis) — SQL funnel analysis and Tableau dashboard | Simulated · 80k events |
+| **Activation** | **this repo** — GA4 Data API → automated weekly report | Real · live |
 
-The property queried here is the same one instrumented in project 1, so the numbers are
-small (it's a demo site) — the point is the working end-to-end pipeline, not the volume.
+```
+                        GA4 event schema
+              ┌───────────────┴───────────────┐
+      real · live · small              simulated · at scale
+     instrumented demo site            80k generated events
+              │                                │
+      Data API ─▶ weekly report        SQL ─▶ Tableau dashboard
+              ▲
+          this repo
+```
+
+**Why two datasets.** A demo site cannot produce the volume an analysis needs
+for its findings to mean anything, and a simulated dataset cannot prove that an
+implementation works. So the live property carries the pipeline end to end, and
+the simulated one carries the analysis. Both speak the same event schema, which
+is what makes the split deliberate rather than convenient.
+
+This repo queries the **real** property — the same one instrumented in the
+collection repo. The numbers are small because it is a demo site; the point is
+a pipeline that runs unattended and reports on what the instrumentation
+actually collects. That is also how two collection defects were found
+([Bug #6 and Bug #7](https://github.com/damondrc/portfolio-analytics/blob/main/Proyecto-3/README.md)):
+the reporting layer surfaced them from the data, not the container.
+
+**The contract between repos.** Event names are **append-only** upstream —
+never renamed or reused — so the queries here only ever need additive changes
+and historical series stay comparable.
 
 ## What the report includes
 
