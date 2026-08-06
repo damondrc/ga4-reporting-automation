@@ -1,6 +1,6 @@
 step,eventName,eventCount,pctOfPrevious,pctOfEntry
-1. Viewed plans,view_item_list,103.0,1.0,1.0
-2. Selected a plan,select_item,7.0,0.06796116504854369,0.06796116504854369
-3. Started signup,begin_checkout,78.0,11.142857142857142,0.7572815533980582
-4. Created account,sign_up,36.0,0.46153846153846156,0.34951456310679613
-5. Converted,purchase,37.0,1.0277777777777777,0.3592233009708738
+1. Viewed plans,view_item_list,141.0,1.0,1.0
+2. Selected a plan,select_item,7.0,0.04964539007092199,0.04964539007092199
+3. Started signup,begin_checkout,105.0,15.0,0.7446808510638298
+4. Created account,sign_up,49.0,0.4666666666666667,0.3475177304964539
+5. Converted,purchase,50.0,1.0204081632653061,0.3546099290780142

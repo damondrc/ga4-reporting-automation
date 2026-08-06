@@ -1,5 +1,6 @@
 sessionSource,sessionMedium,sessions,totalUsers
-traffic-sim,synthetic,79.0,79.0
-(direct),(none),35.0,35.0
+traffic-sim,synthetic,118.0,118.0
+(direct),(none),33.0,33.0
 github.com,referral,5.0,1.0
+(not set),(not set),3.0,3.0
 tagassistant.google.com,referral,2.0,1.0
