@@ -38,10 +38,12 @@ jobs:
         if: always()
         run: rm -f sa-key.json
 
-      - name: Commit updated report
+      - name: Commit updated report and public data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add report/
+          # data/public/ is the published contract every dashboard reads from,
+          # so it has to travel with the report or the two drift apart.
+          git add report/ data/public/
           git diff --cached --quiet || git commit -m "Update weekly GA4 report [automated]"
           git push

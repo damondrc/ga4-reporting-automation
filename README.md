@@ -10,6 +10,8 @@ every Monday** and commits the fresh report — zero manual steps.
 > 📈 **Latest report (live):** **<https://damondrc.github.io/ga4-reporting-automation/>**
 > — regenerated and republished every Monday by [this workflow](.github/workflows/weekly-report.yml).
 > Source: [`report/report.html`](report/report.html) · raw extracts in [`report/data/`](report/data/).
+> 🔌 **Published data contract:** [`data/public/`](data/public/) — stable CSVs over
+> HTTPS for dashboards (Tableau, Power BI). See its [contract](data/public/README.md).
 
 ## Part of a three-repo system
 
@@ -76,6 +78,10 @@ GA4 property ──▶ GA4 Data API ──▶ ga4_report.py ──▶ report/rep
   into a single portable HTML file.
 - **`--demo` mode** — generates sample data with the exact API response shape, so the
   pipeline can be tested with zero credentials: `python ga4_report.py --demo`
+- **`data/public/`** — a **published data contract**: stable snake_case columns,
+  append-only, raw values, versioned. Internal extracts (`report/data/`) are free
+  to change with the queries; this layer is not, because dashboards outside this
+  repo read from it and a renamed column breaks them silently.
 - **`.github/workflows/weekly-report.yml`** — scheduled run; credentials live in GitHub
   Secrets, never in the repo.
 

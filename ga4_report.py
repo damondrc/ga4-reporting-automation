@@ -670,6 +670,113 @@ def quality_panel(checks: list) -> str:
             f'<ul class="checks">{items}</ul></section>')
 
 
+# ---------------------------------------------------------- public data --
+# Everything under data/public/ is a PUBLISHED INTERFACE, not a by-product.
+#
+# report/data/*.csv mirrors whatever the API returned this week: camelCase,
+# raw metric names, shape free to change whenever a query changes. Dashboards
+# must not read it.
+#
+# data/public/*.csv is consumed by things outside this repo — a Google Sheet
+# feeding Tableau Public, a Power BI web query, anything else added later. Those
+# consumers break silently when a column is renamed: a chart keeps rendering
+# with the last cached values and nobody notices for weeks. So this layer has
+# rules:
+#
+#   1. Column names are snake_case and stable, decoupled from GA4's naming.
+#   2. Columns are append-only. Never renamed, never removed, never reordered.
+#   3. Rates stay decimal (0-1) and dates ISO — formatting belongs to the
+#      dashboard, not to the interface.
+#   4. Counts are integers.
+#   5. Any breaking change means a new SCHEMA_VERSION and a new directory,
+#      leaving the old one in place until consumers have migrated.
+#
+# It is the same append-only discipline the upstream event names follow.
+PUBLIC_SCHEMA_VERSION = "1.0"
+
+
+def public_tables(data: dict, days: int) -> dict:
+    """Map the internal frames onto the published schema."""
+    out = {}
+
+    daily = data.get("daily_overview", pd.DataFrame())
+    if not daily.empty:
+        d = daily.rename(columns={
+            "totalUsers": "users",
+            "screenPageViews": "page_views",
+            "eventCount": "events",
+        }).copy()
+        d["date"] = pd.to_datetime(d["date"]).dt.strftime("%Y-%m-%d")
+        for c in ("sessions", "users", "page_views", "events"):
+            d[c] = d[c].round(0).astype(int)
+        out["daily_kpis"] = d[["date", "sessions", "users", "page_views", "events"]]
+
+    funnel = data.get("funnel", pd.DataFrame())
+    if not funnel.empty:
+        f = funnel.copy()
+        # "1. Viewed plans" -> step_number 1, step_name "Viewed plans", so a
+        # dashboard can sort by the journey without parsing a label.
+        parts = f["step"].str.split(".", n=1, expand=True)
+        f["step_number"] = parts[0].astype(int)
+        f["step_name"] = parts[1].str.strip()
+        f["event_count"] = f["eventCount"].round(0).astype(int)
+        out["funnel"] = f.rename(columns={
+            "eventName": "event_name",
+            "pctOfPrevious": "pct_of_previous",
+            "pctOfEntry": "pct_of_entry",
+        })[["step_number", "step_name", "event_name", "event_count",
+            "pct_of_previous", "pct_of_entry"]]
+
+    ch = data.get("by_channel", pd.DataFrame())
+    if not ch.empty:
+        c = ch.rename(columns={
+            "sessionSource": "source",
+            "sessionMedium": "medium",
+            "totalUsers": "users",
+        }).copy()
+        for col in ("sessions", "users"):
+            c[col] = c[col].round(0).astype(int)
+        out["by_channel"] = c[["source", "medium", "sessions", "users"]]
+
+    dev = data.get("by_device", pd.DataFrame())
+    if not dev.empty:
+        v = dev.rename(columns={
+            "deviceCategory": "device",
+            "engagementRate": "engagement_rate",
+        }).copy()
+        v["sessions"] = v["sessions"].round(0).astype(int)
+        out["by_device"] = v[["device", "sessions", "engagement_rate"]]
+
+    plans = data.get("by_plan", pd.DataFrame())
+    if not plans.empty:
+        p = plans.rename(columns={"eventCount": "signups"}).copy()
+        p["signups"] = p["signups"].round(0).astype(int)
+        out["by_plan"] = p[["plan", "signups", "share"]]
+
+    # Every consumer needs to answer "how old is this?" without trusting a
+    # file timestamp that git rewrites on checkout.
+    start, end = report_window(days)
+    out["meta"] = pd.DataFrame([{
+        "schema_version": PUBLIC_SCHEMA_VERSION,
+        "generated_at_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "window_start": start.isoformat(),
+        "window_end": end.isoformat(),
+        "window_days": days,
+        "source": "GA4 Data API",
+    }])
+    return out
+
+
+def write_public_contract(data: dict, public_dir: str, days: int) -> list:
+    os.makedirs(public_dir, exist_ok=True)
+    written = []
+    for name, df in public_tables(data, days).items():
+        path = os.path.join(public_dir, f"{name}.csv")
+        df.to_csv(path, index=False)
+        written.append(os.path.basename(path))
+    return written
+
+
 def build_html(data: dict, charts: dict, days: int, demo: bool) -> str:
     daily = data["daily_overview"]
     prev = data.get("previous_period", pd.DataFrame())
@@ -883,6 +990,17 @@ def main():
     os.makedirs(csv_dir, exist_ok=True)
     for name, df in data.items():
         df.to_csv(os.path.join(csv_dir, f"{name}.csv"), index=False)
+
+    # The published contract lives next to the report's parent directory, so a
+    # run with --output /tmp/... writes its public files to /tmp too. That is
+    # deliberate: `--demo` must never be able to overwrite the real published
+    # data with sample values, the same reason CI redirects the HTML output.
+    public_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(args.output))),
+        "data", "public")
+    written = write_public_contract(data, public_dir, args.days)
+    print(f"Public contract v{PUBLIC_SCHEMA_VERSION} written to {public_dir} "
+          f"({', '.join(written)})")
 
     charts = make_charts(data)
     html = build_html(data, charts, args.days, args.demo)
