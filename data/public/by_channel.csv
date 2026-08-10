@@ -1,6 +1,7 @@
 source,medium,sessions,users
-traffic-sim,synthetic,118,118
-(direct),(none),33,33
+traffic-sim,synthetic,155,155
+(direct),(none),32,32
+(not set),(not set),13,13
+(data not available),(data not available),10,10
 github.com,referral,5,1
-(not set),(not set),3,3
 tagassistant.google.com,referral,2,1
